@@ -1,0 +1,45 @@
+[package]
+name    = "alfred-app"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "alfred-app"
+path = "src/main.rs"
+
+[dependencies]
+# Windowing
+winit = "0.30"
+
+# GPU
+wgpu     = "22"
+pollster = "0.3"
+
+# Text rendering
+glyphon     = "0.7"
+cosmic-text = "0.14"
+
+# Terminal emulation
+alacritty_terminal = "0.24"
+vte                = "0.15"
+
+# PTY
+portable-pty = "0.9"
+
+# Async
+tokio = { workspace = true }
+
+# Config / serialization
+serde = { workspace = true }
+toml  = "0.8"
+
+# Utilities
+anyhow     = { workspace = true }
+log        = { workspace = true }
+env_logger = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_System_Console",
+    "Win32_System_Pipes",
+] }

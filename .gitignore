@@ -1,0 +1,6 @@
+/target
+Cargo.lock
+*.pdb
+*.exp
+*.lib
+.env
