@@ -15,7 +15,8 @@ const LINE_HEIGHT: f32 = 18.0;
 const PADDING: f32 = 4.0;
 
 pub struct Renderer {
-    window: Arc<Window>,
+    /// Kept alive to ensure the surface remains valid (Arc ownership).
+    _window: Arc<Window>,
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -39,43 +40,25 @@ impl Renderer {
             ..Default::default()
         });
 
-        // SAFETY: surface lives as long as `window` which is Arc-owned and
-        // lives at least as long as Renderer.
+        // SAFETY: surface lives as long as window (Arc-owned).
         let surface = instance.create_surface(window.clone())?;
 
-        // ── Adapter — prefer AMD by name to work around iGPU misreport ────
-        let adapter = {
-            let candidates = instance
-                .enumerate_adapters(crate::platform::gpu_backends())
-                .collect::<Vec<_>>();
+        // ── Adapter ─────────────────────────────────────────────────────
+        // Log all candidates so the user can verify AMD iGPU is selected.
+        let candidates = instance.enumerate_adapters(crate::platform::gpu_backends());
+        for a in &candidates {
+            let info = a.get_info();
+            log::debug!("GPU candidate: {} ({:?})", info.name, info.device_type);
+        }
 
-            // First try: AMD adapter by name
-            let amd = candidates.iter().find(|a| {
-                a.get_info().name.to_lowercase().contains("amd")
-                    || a.get_info().name.to_lowercase().contains("radeon")
-            });
-
-            if let Some(a) = amd {
-                // Can't clone Adapter; re-request it
-                instance
-                    .request_adapter(&wgpu::RequestAdapterOptions {
-                        power_preference: wgpu::PowerPreference::None,
-                        compatible_surface: Some(&surface),
-                        force_fallback_adapter: false,
-                    })
-                    .await
-                    .ok_or_else(|| anyhow::anyhow!("no AMD adapter"))?
-            } else {
-                instance
-                    .request_adapter(&wgpu::RequestAdapterOptions {
-                        power_preference: wgpu::PowerPreference::None,
-                        compatible_surface: Some(&surface),
-                        force_fallback_adapter: false,
-                    })
-                    .await
-                    .ok_or_else(|| anyhow::anyhow!("no GPU adapter found"))?
-            }
-        };
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::None,
+                compatible_surface: Some(&surface),
+                force_fallback_adapter: false,
+            })
+            .await
+            .ok_or_else(|| anyhow::anyhow!("no GPU adapter found"))?;
 
         log::info!("Using GPU: {}", adapter.get_info().name);
 
@@ -113,7 +96,7 @@ impl Renderer {
         surface.configure(&device, &config);
 
         // ── glyphon setup ──────────────────────────────────────────────────
-        let font_system = FontSystem::new();
+        let mut font_system = FontSystem::new();
         let swash_cache = SwashCache::new();
         let cache = Cache::new(&device);
         let viewport = Viewport::new(&device, &cache);
@@ -121,16 +104,11 @@ impl Renderer {
         let text_renderer =
             TextRenderer::new(&mut atlas, &device, MultisampleState::default(), None);
 
-        let mut text_buffer = Buffer::new_empty(Metrics::new(FONT_SIZE, LINE_HEIGHT));
-        // Pre-size to full window
-        text_buffer.set_size(
-            &mut font_system.clone_for_init(),
-            Some(size.width as f32),
-            Some(size.height as f32),
-        );
+        // Create an empty buffer; size is set on first render.
+        let text_buffer = Buffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
 
         Ok(Self {
-            window,
+            _window: window,
             surface,
             device,
             queue,
@@ -172,8 +150,7 @@ impl Renderer {
         let w = self.config.width as f32;
         let h = self.config.height as f32;
 
-        // ── Build coloured text from terminal cells ────────────────────────
-        // Collect into rows, then build rich-text spans for glyphon.
+        // ── Build text ─────────────────────────────────────────────────────
         let rows = build_rows(cells);
         let spans = build_spans(&rows, cursor);
 
@@ -183,14 +160,14 @@ impl Renderer {
             Some(h - PADDING * 2.0),
         );
 
-        // set_rich_text replaces all existing content
         self.text_buffer.set_rich_text(
             &mut self.font_system,
             spans.iter().map(|(s, a)| (s.as_str(), *a)),
             Attrs::new().family(Family::Monospace),
             Shaping::Basic,
         );
-        self.text_buffer.shape_until_scroll(&mut self.font_system, false);
+        self.text_buffer
+            .shape_until_scroll(&mut self.font_system, false);
 
         // ── glyphon prepare ────────────────────────────────────────────────
         self.viewport.update(
@@ -219,7 +196,7 @@ impl Renderer {
                         right: self.config.width as i32,
                         bottom: self.config.height as i32,
                     },
-                    default_color: Color::rgb(204, 204, 204),
+                    default_color: Color::rgb(235, 219, 178),
                     custom_glyphs: &[],
                 }],
                 &mut self.swash_cache,
@@ -241,9 +218,9 @@ impl Renderer {
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.071,
-                            g: 0.071,
-                            b: 0.071,
+                            r: 0.157,
+                            g: 0.157,
+                            b: 0.157,
                             a: 1.0,
                         }),
                         store: wgpu::StoreOp::Store,
@@ -266,7 +243,7 @@ impl Renderer {
     }
 }
 
-// ── Helper: build per-row strings from flat cell list ─────────────────────────
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
 type Row = Vec<TermCell>;
 
@@ -279,82 +256,75 @@ fn build_rows(cells: &[TermCell]) -> Vec<Row> {
     for cell in cells {
         rows[cell.row as usize].push(cell.clone());
     }
-    // Sort each row by column
     for row in &mut rows {
         row.sort_by_key(|c| c.col);
     }
     rows
 }
 
-// ── Helper: build (String, Attrs) spans for glyphon's set_rich_text ──────────
-
+/// Build `(text, Attrs)` spans for `set_rich_text`.
+///
+/// Groups consecutive same-coloured cells into a single span so we minimise
+/// the number of spans without sacrificing per-cell colour accuracy.
 fn build_spans(rows: &[Row], cursor: (u16, u16)) -> Vec<(String, Attrs<'static>)> {
     let mut spans: Vec<(String, Attrs<'static>)> = Vec::new();
     let (cur_row, cur_col) = cursor;
+    let default_attrs = Attrs::new().family(Family::Monospace);
 
     for (row_idx, row) in rows.iter().enumerate() {
-        // Collect chars; fill gaps with spaces
-        let max_col = row.last().map(|c| c.col).unwrap_or(0) as usize;
-        let mut row_chars: Vec<(char, [u8; 3], [u8; 3])> =
-            vec![(' ', [204, 204, 204], [18, 18, 18]); max_col + 1];
+        if row.is_empty() {
+            spans.push(("\n".to_string(), default_attrs));
+            continue;
+        }
 
+        // Fill a contiguous array of (char, fg_rgb) so gaps become spaces.
+        let max_col = row.last().map(|c| c.col).unwrap_or(0) as usize;
+        let mut row_chars: Vec<(char, [u8; 3])> =
+            vec![(' ', [235u8, 219, 178]); max_col + 1];
         for cell in row {
-            let idx = cell.col as usize;
-            if idx < row_chars.len() {
-                row_chars[idx] = (cell.ch, cell.fg, cell.bg);
+            if (cell.col as usize) < row_chars.len() {
+                row_chars[cell.col as usize] = (cell.ch, cell.fg);
             }
         }
 
-        // Group consecutive cells with the same colour into one span
+        // Merge runs with the same colour into one span
         let mut i = 0;
         while i < row_chars.len() {
-            let (ch, fg, _bg) = row_chars[i];
-            let is_cursor =
-                row_idx as u16 == cur_row && i as u16 == cur_col;
+            let (ch, fg) = row_chars[i];
+            let is_cursor = row_idx as u16 == cur_row && i as u16 == cur_col;
 
             let color = if is_cursor {
-                Color::rgb(18, 18, 18) // cursor: inverted fg
+                // Inverted cursor block
+                Color::rgb(40, 40, 40)
             } else {
                 Color::rgb(fg[0], fg[1], fg[2])
             };
 
-            // Extend run while same colour and not cursor boundary
             let mut run = String::new();
             run.push(ch);
             let mut j = i + 1;
-            while j < row_chars.len() {
-                let (nch, nfg, _) = row_chars[j];
-                let next_is_cursor = row_idx as u16 == cur_row && j as u16 == cur_col;
-                if nfg == fg && !is_cursor && !next_is_cursor {
-                    run.push(nch);
-                    j += 1;
-                } else {
-                    break;
+            if !is_cursor {
+                while j < row_chars.len() {
+                    let (nch, nfg) = row_chars[j];
+                    let next_cursor = row_idx as u16 == cur_row && j as u16 == cur_col;
+                    if nfg == fg && !next_cursor {
+                        run.push(nch);
+                        j += 1;
+                    } else {
+                        break;
+                    }
                 }
             }
 
-            let attrs = Attrs::new().family(Family::Monospace).color(color);
+            let attrs = default_attrs.color(color);
             spans.push((run, attrs));
             i = j;
         }
 
-        // Newline between rows (except last)
         if row_idx + 1 < rows.len() {
-            spans.push(("\n".to_string(), Attrs::new().family(Family::Monospace)));
+            spans.push(("\n".to_string(), default_attrs));
         }
     }
 
     spans
-}
-
-// ── Trait helpers to make FontSystem work in init context ─────────────────────
-
-trait FontSystemExt {
-    fn clone_for_init(&mut self) -> &mut FontSystem;
-}
-
-impl FontSystemExt for FontSystem {
-    fn clone_for_init(&mut self) -> &mut FontSystem {
-        self
-    }
 }

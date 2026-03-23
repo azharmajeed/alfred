@@ -6,7 +6,7 @@
 //!   2. Launches a blocking reader task that sends `UserEvent::PtyOutput` to winit.
 //!   3. Drives a writer loop that forwards keyboard bytes to the PTY master.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};

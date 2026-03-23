@@ -12,7 +12,7 @@ path = "src/main.rs"
 winit = "0.30"
 
 # GPU
-wgpu     = "22"
+wgpu     = "23"
 pollster = "0.3"
 
 # Text rendering
