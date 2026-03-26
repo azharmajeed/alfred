@@ -189,34 +189,39 @@ alfred/
 ### Threading Model
 
 ```
-Main Thread (winit event loop)
+Main Thread (winit event loop + wgpu render)
+  │  processes UserEvent::PtyOutput{pane_id, bytes} → update terminal → request_redraw
+  │  processes WindowEvent::RedrawRequested → wgpu render pass
+  │  handles keyboard → active pane pty_tx
+  │  handles MouseWheel → active pane scroll_display
   │
-  ├── Render Thread
-  │     wgpu render pass → glyphon text → swapchain present
-  │
-  ├── Pane Tasks (one per pane, tokio)
-  │     PTY reader → vte parser → terminal grid update → dirty flag
-  │
-  ├── IPC Server Task (tokio)
-  │     Named pipe / Unix socket → command dispatch
-  │
-  └── Git Query Tasks (tokio spawn_blocking)
-        git2 → branch/status → sidebar state
+Tokio Runtime (2 worker threads, Arc-shared)
+  └── Per-pane PTY tasks (one reader + one writer per pane):
+        PTY reader (spawn_blocking)
+          reads PTY master → EventLoopProxy::send_event(PtyOutput{pane_id})
+        PTY writer (async)
+          UnboundedReceiver<Vec<u8>> → writes to PTY master
+          fed by: keyboard input (app.rs) + VT PtyWrite responses (EventProxy)
+
+Planned (not yet implemented):
+  ├── IPC Server Task — named pipe / Unix socket
+  └── Git Query Tasks (spawn_blocking) — git2 branch/status
 ```
 
 ### State Model
 
 ```
-AppState
-  └── WorkspaceManager
+AppInner
+  └── WorkspaceManager (scale_factor: f32)
         └── Vec<Workspace>
               ├── name: String
-              ├── layout: PaneTree (binary tree)
-              │     └── leaf: Pane
-              │           ├── TerminalModel (alacritty_terminal::Term)
-              │           ├── PtyHandle (portable-pty)
-              │           ├── NotificationState
-              │           └── dirty: AtomicBool
+              ├── tree: PaneTree (binary split tree)
+              ├── active_pane: PaneId
+              └── panes: HashMap<PaneId, Pane>
+                    └── Pane
+                          ├── terminal: Arc<Mutex<TerminalState>>
+                          ├── pty_tx: UnboundedSender<Vec<u8>>
+                          └── dirty: Arc<AtomicBool>
               └── git_info: GitInfo (branch, status)
 ```
 
@@ -227,21 +232,21 @@ AppState
 ### `crates/alfred-app/src/`
 
 ```
-main.rs                  — winit event loop, wgpu init, top-level dispatch
-app.rs                   — AppState, frame render coordination
+main.rs                  — winit event loop entry point
+app.rs                   — ApplicationHandler, WorkspaceManager wiring, all shortcuts
+renderer.rs              — wgpu + glyphon multi-pane renderer (HashMap<PaneId,Buffer>)
 
 terminal/
   mod.rs
-  pty.rs                 — spawn shell via portable-pty, read/write tasks
-  emulator.rs            — wrap alacritty_terminal::Term, feed PTY bytes
-  renderer.rs            — custom wgpu widget: map terminal grid → glyphon text
-  osc.rs                 — OSC 9/99/777 parser on top of vte::Perform
+  pty.rs                 — spawn shell via portable-pty; per-pane tagged UserEvents
+  emulator.rs            — alacritty_terminal::Term wrapper; collect_frame, scroll_display
+  osc.rs (planned)       — OSC 9/99/777 parser on top of vte::Perform
 
-workspace/
+workspace/               — Phase 2 ✅
   mod.rs
-  manager.rs             — WorkspaceManager: create/delete/switch workspaces
-  pane.rs                — Pane: owns TerminalModel + PtyHandle
-  layout.rs              — PaneTree: binary tree for splits, resize math
+  pane.rs                — Pane: terminal Arc<Mutex<>>, pty_tx, dirty AtomicBool
+  layout.rs              — PaneTree binary split tree; PhysRect; 15 unit tests
+  manager.rs             — WorkspaceManager: split/focus/resize/remove; scale_factor
 
 ui/
   mod.rs
@@ -518,30 +523,39 @@ mod platform {
 
 ## 15. Build Phases
 
-### Phase 1 — Core Terminal
+### Phase 1 — Core Terminal ✅
 
-- [ ] Cargo workspace: `alfred-app` + `alfred-cli` crates
-- [ ] `winit` event loop + `wgpu` surface (DX12 on Windows, Vulkan on Linux)
-- [ ] `portable-pty` (patched) spawning a shell
-- [ ] `alacritty_terminal` fed PTY bytes via tokio task
-- [ ] Custom wgpu render widget: terminal grid → `glyphon` text
-- [ ] Keyboard input: winit key events → PTY write
-- [ ] Resize: winit resize → ConPTY resize → terminal model resize
-- [ ] Cursor rendering (blinking block)
-- [ ] 256-color + truecolor support
-- [ ] Scrollback
+- [x] Cargo workspace: `alfred-app` + `alfred-cli` crates
+- [x] `winit` event loop + `wgpu` surface (DX12 on Windows, Vulkan on Linux)
+- [x] `portable-pty` spawning a shell (unpatched 0.9; ConPTY flags deferred)
+- [x] `alacritty_terminal` fed PTY bytes via tokio task
+- [x] Custom wgpu render widget: terminal grid → `glyphon` text
+- [x] Keyboard input: winit key events → PTY write
+- [x] Resize: winit resize → ConPTY resize → terminal model resize
+- [x] Cursor rendering (█ block, Gruvbox fg colour)
+- [x] 256-color + truecolor support
+- [x] VT response forwarding (DSR / PtyWrite — fixes PowerShell/cmd hang)
+- [x] HiDPI / DPI scaling
+- [ ] Cursor blinking (static block only)
+- [ ] Scrollback UI (data tracked; no wheel scroll in Phase 1)
 
-**Success criterion:** `cargo run` opens a window with a working shell.
+**Success criterion:** `cargo run` opens a window with a working shell. ✅
 
-### Phase 2 — Multiplexing
+### Phase 2 — Multiplexing ✅
 
-- [ ] Horizontal + vertical split panes (binary tree layout)
-- [ ] Tab bar (create, switch, close, rename)
-- [ ] Focus management (keyboard shortcuts)
-- [ ] Pane resize (drag divider)
+- [x] Horizontal + vertical split panes (`PaneTree` binary tree)
+- [x] Workspace tabs (create `Ctrl+Shift+T`, switch `Ctrl+Tab`, close `Ctrl+Shift+W`)
+- [x] Focus management (keyboard shortcuts `Ctrl+Shift+[/]`)
+- [x] Per-pane PTY — each pane has its own independent shell
+- [x] Mouse-wheel scrollback
+- [x] HiDPI double-scale bug fixed; scale_factor-aware cell sizing
+- [x] `needs_reshape` optimisation — skip font-shaping for unchanged panes
+- [x] 15 unit tests for `PaneTree` layout and mutation
+- [ ] Tab bar rendered in window chrome (state exists, UI not drawn)
+- [ ] Pane resize by dragging the divider
 - [ ] Session persistence (save/restore on exit/start)
 
-**Success criterion:** Multiple shells in split panes, tab switching works.
+**Success criterion:** Multiple shells in split panes, tab switching works. ✅
 
 ### Phase 3 — Sidebar
 
@@ -611,62 +625,46 @@ Ghostty is written in Zig with a C ABI (`libghostty`). Rust FFI to C is possible
 alfred/
 ├── Cargo.toml                        # Workspace manifest
 ├── ARCHITECTURE.md                   # This document
-├── README.md                         # User-facing docs
-├── .github/
-│   └── workflows/
-│       ├── build-windows.yml
-│       └── build-linux.yml
+├── docs/
+│   ├── phase1-scaffold.md
+│   └── phase2-multiplexing.md
 │
 ├── crates/
 │   ├── alfred-app/
 │   │   ├── Cargo.toml
-│   │   ├── build.rs                  # Copy DXC dll, embed Windows manifest
 │   │   └── src/
-│   │       ├── main.rs
-│   │       ├── app.rs
+│   │       ├── main.rs               # EventLoop::<UserEvent> entry point
+│   │       ├── app.rs                # ApplicationHandler, WorkspaceManager, shortcuts
+│   │       ├── renderer.rs           # wgpu + glyphon multi-pane renderer
 │   │       ├── terminal/
 │   │       │   ├── mod.rs
-│   │       │   ├── pty.rs
-│   │       │   ├── emulator.rs
-│   │       │   ├── renderer.rs
-│   │       │   └── osc.rs
-│   │       ├── workspace/
+│   │       │   ├── pty.rs            # PTY spawn + async I/O (per-pane, tagged events)
+│   │       │   └── emulator.rs       # alacritty_terminal wrapper; collect_frame, scroll_display
+│   │       ├── workspace/            # ← Phase 2
 │   │       │   ├── mod.rs
-│   │       │   ├── manager.rs
-│   │       │   ├── pane.rs
-│   │       │   └── layout.rs
-│   │       ├── ui/
-│   │       │   ├── mod.rs
-│   │       │   ├── sidebar.rs
-│   │       │   ├── tabbar.rs
-│   │       │   ├── notification.rs
-│   │       │   └── theme.rs
-│   │       ├── ipc/
-│   │       │   ├── server.rs
-│   │       │   └── commands.rs
-│   │       ├── config/
-│   │       │   ├── mod.rs
-│   │       │   └── types.rs
-│   │       ├── git/
-│   │       │   └── mod.rs
+│   │       │   ├── pane.rs           # Pane: terminal + pty_tx + dirty flag
+│   │       │   ├── layout.rs         # PaneTree binary split tree + 15 unit tests
+│   │       │   └── manager.rs        # WorkspaceManager: split/focus/resize/remove
 │   │       └── platform/
-│   │           ├── mod.rs
-│   │           ├── windows.rs
-│   │           └── linux.rs
+│   │           ├── mod.rs            # gpu_backends(), default_shell()
+│   │           ├── windows.rs        # pwsh > powershell > cmd detection
+│   │           └── linux.rs          # $SHELL detection
+│   │
+│   │   Planned (Phase 3+):
+│   │       ├── terminal/osc.rs       # OSC 777/9/99 intercept
+│   │       ├── ui/                   # sidebar, tabbar, notification overlay, theme
+│   │       ├── ipc/                  # named pipe / Unix socket server
+│   │       ├── config/               # TOML config load/save
+│   │       └── git/                  # git2 branch/status queries
 │   │
 │   └── alfred-cli/
 │       ├── Cargo.toml
 │       └── src/
-│           └── main.rs
+│           └── main.rs               # clap CLI stub (IPC not yet wired)
 │
-├── assets/
-│   ├── fonts/
-│   │   └── CascadiaCode.ttf          # Bundled fallback monospace font
-│   └── icons/
-│       └── alfred.ico
-│
-└── vendor/
-    └── portable-pty/                 # Patched fork with ConPTY flags
+└── assets/ (planned)
+    ├── fonts/CascadiaCode.ttf        # Bundled fallback monospace font
+    └── icons/alfred.ico
 ```
 
 ---
@@ -685,7 +683,7 @@ serde    = { version = "1",    features = ["derive"] }
 # alfred-app specific
 [dependencies]
 winit             = "0.30"
-wgpu              = { version = "28", features = ["dx12", "vulkan"] }
+wgpu              = { version = "23", features = ["dx12", "vulkan"] }  # actual resolved version
 glyphon           = "0.7"
 cosmic-text       = "0.14"
 alacritty_terminal = "0.24"
