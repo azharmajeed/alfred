@@ -116,15 +116,26 @@ impl Renderer {
                 r"C:\Windows\Fonts\consolaz.ttf",    // Consolas bold italic
                 r"C:\Windows\Fonts\lucon.ttf",       // Lucida Console
             ];
-            let mut count = 0usize;
+            let mut loaded_name: Option<&str> = None;
             for path in &candidates {
                 if let Ok(bytes) = std::fs::read(path) {
                     font_system.db_mut().load_font_data(bytes);
                     log::debug!("Loaded font: {path}");
-                    count += 1;
+                    if loaded_name.is_none() {
+                        loaded_name = Some(match *path {
+                            p if p.contains("Cascadia") => "Cascadia Code",
+                            p if p.contains("consola")  => "Consolas",
+                            _                            => "Lucida Console",
+                        });
+                    }
                 }
             }
-            log::info!("Loaded {count} monospace font(s) from system");
+
+            // Tell fontdb which family to use for Family::Monospace.
+            // Without this call, Family::Monospace resolves to nothing on Windows.
+            let mono = loaded_name.unwrap_or("Consolas");
+            font_system.db_mut().set_monospace_family(mono);
+            log::info!("Monospace family set to: {mono}");
         }
         let swash_cache = SwashCache::new();
         let cache = Cache::new(&device);
@@ -182,6 +193,18 @@ impl Renderer {
         // ── Build text ─────────────────────────────────────────────────────
         let rows = build_rows(cells);
         let spans = build_spans(&rows, cursor);
+
+        // Debug: log on first few renders so we can confirm data is flowing.
+        static RENDER_COUNT: std::sync::atomic::AtomicU32 =
+            std::sync::atomic::AtomicU32::new(0);
+        let rc = RENDER_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if rc < 5 {
+            let non_space = cells.iter().filter(|c| c.ch != ' ').count();
+            log::info!(
+                "render #{rc}: {} total cells, {} non-space, {} spans",
+                cells.len(), non_space, spans.len()
+            );
+        }
 
         self.text_buffer.set_size(
             &mut self.font_system,
