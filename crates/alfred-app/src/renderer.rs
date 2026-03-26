@@ -31,10 +31,12 @@ pub struct Renderer {
     atlas: TextAtlas,
     text_renderer: TextRenderer,
     text_buffer: Buffer,
+    scale_factor: f32,
 }
 
 impl Renderer {
     pub async fn new(window: Arc<Window>) -> anyhow::Result<Self> {
+        let scale_factor = window.scale_factor() as f32;
         let size = window.inner_size();
 
         // ── wgpu instance ──────────────────────────────────────────────────
@@ -145,7 +147,11 @@ impl Renderer {
             TextRenderer::new(&mut atlas, &device, MultisampleState::default(), None);
 
         // Create an empty buffer; size is set on first render.
-        let text_buffer = Buffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
+        // Scale font metrics by DPI so text is physically correct on HiDPI screens.
+        let text_buffer = Buffer::new(
+            &mut font_system,
+            Metrics::new(FONT_SIZE * scale_factor, LINE_HEIGHT * scale_factor),
+        );
 
         Ok(Self {
             _window: window,
@@ -159,6 +165,7 @@ impl Renderer {
             atlas,
             text_renderer,
             text_buffer,
+            scale_factor,
         })
     }
 
@@ -241,7 +248,7 @@ impl Renderer {
                     buffer: &self.text_buffer,
                     left: PADDING,
                     top: PADDING,
-                    scale: 1.0,
+                    scale: self.scale_factor,
                     bounds: TextBounds {
                         left: 0,
                         top: 0,
@@ -350,14 +357,19 @@ fn build_spans(rows: &[Row], cursor: (u16, u16)) -> Vec<(String, Attrs<'static>)
             let is_cursor = row_idx as u16 == cur_row && i as u16 == cur_col;
 
             let color = if is_cursor {
-                // Inverted cursor block
-                Color::rgb(40, 40, 40)
+                Color::rgb(235, 219, 178) // Gruvbox fg — bright block on dark bg
             } else {
                 Color::rgb(fg[0], fg[1], fg[2])
             };
 
             let mut run = String::new();
-            run.push(ch);
+            // Render cursor as a full-block character (█) so it's visible
+            // even when the underlying cell is a space.
+            if is_cursor {
+                run.push('█');
+            } else {
+                run.push(ch);
+            }
             let mut j = i + 1;
             if !is_cursor {
                 while j < row_chars.len() {

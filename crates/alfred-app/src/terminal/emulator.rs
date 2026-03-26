@@ -7,17 +7,35 @@
 //!   - `term.resize(size)` — size implements Dimensions
 //!   - Colours live in `vte::ansi::Color` re-exported as `alacritty_terminal::vte::ansi::Color`
 
-use alacritty_terminal::event::EventListener;
+use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::term::{test::TermSize, Config, Term};
 use alacritty_terminal::vte::ansi::Processor;
+use tokio::sync::mpsc::UnboundedSender;
 
-// ── No-op event listener ──────────────────────────────────────────────────────
+// ── Event listener — forwards PtyWrite responses back to the shell ────────────
+//
+// The VT processor emits Event::PtyWrite for terminal responses that must be
+// sent back to the child (e.g. cursor-position report \x1b[row;colR in reply
+// to a DSR \x1b[6n query).  Without this, programs like cmd.exe hang on
+// startup waiting for the response.
 
 #[derive(Clone)]
-pub struct EventProxy;
+pub struct EventProxy {
+    pty_tx: UnboundedSender<Vec<u8>>,
+}
+
+impl EventProxy {
+    pub fn new(pty_tx: UnboundedSender<Vec<u8>>) -> Self {
+        Self { pty_tx }
+    }
+}
 
 impl EventListener for EventProxy {
-    fn send_event(&self, _event: alacritty_terminal::event::Event) {}
+    fn send_event(&self, event: Event) {
+        if let Event::PtyWrite(s) = event {
+            let _ = self.pty_tx.send(s.into_bytes());
+        }
+    }
 }
 
 // ── Public cell type passed to the renderer ───────────────────────────────────
@@ -43,9 +61,9 @@ pub struct TerminalState {
 }
 
 impl TerminalState {
-    pub fn new(cols: u16, rows: u16) -> Self {
+    pub fn new(cols: u16, rows: u16, pty_tx: UnboundedSender<Vec<u8>>) -> Self {
         let size = TermSize { columns: cols as usize, screen_lines: rows as usize };
-        let term = Term::new(Config::default(), &size, EventProxy);
+        let term = Term::new(Config::default(), &size, EventProxy::new(pty_tx));
         let processor = Processor::new();
         Self { term, processor, cols, rows }
     }

@@ -68,14 +68,11 @@ impl ApplicationHandler<UserEvent> for App {
             .with_inner_size(winit::dpi::LogicalSize::new(1200u32, 800u32));
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
         let size = window.inner_size();
+        let scale = window.scale_factor() as f32;
 
         let (cw, ch) = Self::cell_dims();
-        let cols = (size.width as f32 / cw).floor().max(1.0) as u16;
-        let rows = (size.height as f32 / ch).floor().max(1.0) as u16;
-
-        // ── Terminal state (shared between winit thread and tokio tasks) ───
-        let terminal = Arc::new(Mutex::new(TerminalState::new(cols, rows)));
-        let dirty = Arc::new(AtomicBool::new(true));
+        let cols = (size.width as f32 / (cw * scale)).floor().max(1.0) as u16;
+        let rows = (size.height as f32 / (ch * scale)).floor().max(1.0) as u16;
 
         // ── Tokio runtime for PTY I/O ──────────────────────────────────────
         let rt = tokio::runtime::Builder::new_multi_thread()
@@ -84,7 +81,14 @@ impl ApplicationHandler<UserEvent> for App {
             .build()
             .expect("tokio runtime");
 
+        // Channel shared by keyboard input AND terminal PtyWrite responses.
         let (pty_tx, pty_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+
+        // ── Terminal state (shared between winit thread and tokio tasks) ───
+        // pty_tx clone given to EventProxy so VT responses (e.g. DSR cursor
+        // position reply) are forwarded back to the shell automatically.
+        let terminal = Arc::new(Mutex::new(TerminalState::new(cols, rows, pty_tx.clone())));
+        let dirty = Arc::new(AtomicBool::new(true));
 
         let term_clone = terminal.clone();
         let dirty_clone = dirty.clone();
@@ -150,9 +154,10 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::Resized(new_size) => {
                 if new_size.width > 0 && new_size.height > 0 {
                     inner.renderer.resize(new_size);
+                    let scale = inner.window.scale_factor() as f32;
                     let (cw, ch) = Self::cell_dims();
-                    let cols = (new_size.width as f32 / cw).floor().max(1.0) as u16;
-                    let rows = (new_size.height as f32 / ch).floor().max(1.0) as u16;
+                    let cols = (new_size.width as f32 / (cw * scale)).floor().max(1.0) as u16;
+                    let rows = (new_size.height as f32 / (ch * scale)).floor().max(1.0) as u16;
                     let mut term = inner.terminal.lock().unwrap();
                     term.resize(cols, rows);
                 }

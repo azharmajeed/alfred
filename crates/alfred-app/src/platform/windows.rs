@@ -4,6 +4,10 @@ use std::path::PathBuf;
 
 /// Detect the best available shell in priority order:
 ///   PowerShell Core → PowerShell 5 → %COMSPEC% (cmd.exe)
+///
+/// Both PowerShell variants work because EventProxy now forwards VT PtyWrite
+/// responses (e.g. DSR cursor-position reply) back to the shell, preventing
+/// the startup hang that was caused by unanswered \x1b[6n queries.
 pub fn default_shell() -> PathBuf {
     // PowerShell Core (pwsh.exe) — installed via winget / Store / manual
     if let Some(pwsh) = find_on_path("pwsh.exe") {
@@ -26,6 +30,7 @@ pub fn default_shell() -> PathBuf {
     PathBuf::from("cmd.exe")
 }
 
+#[allow(dead_code)]
 fn find_on_path(exe: &str) -> Option<PathBuf> {
     if let Ok(path_var) = std::env::var("PATH") {
         for dir in std::env::split_paths(&path_var) {
