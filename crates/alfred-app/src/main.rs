@@ -2,6 +2,7 @@ mod app;
 mod platform;
 mod renderer;
 mod terminal;
+mod workspace;
 
 use winit::event_loop::EventLoop;
 

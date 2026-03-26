@@ -1,6 +1,6 @@
 //! PTY spawning and I/O tasks.
 //!
-//! `run_pty` is spawned as a tokio task from `app::App::resumed`.
+//! `run_pty` is spawned as a tokio task from `WorkspaceManager`.
 //! It:
 //!   1. Spawns a shell via `portable-pty` (ConPTY on Windows, Unix PTY on Linux).
 //!   2. Launches a blocking reader task that sends `UserEvent::PtyOutput` to winit.
@@ -15,8 +15,10 @@ use winit::event_loop::EventLoopProxy;
 
 use crate::app::UserEvent;
 use crate::terminal::emulator::TerminalState;
+use crate::workspace::pane::PaneId;
 
 pub async fn run_pty(
+    pane_id: PaneId,
     cols: u16,
     rows: u16,
     mut writer_rx: UnboundedReceiver<Vec<u8>>,
@@ -34,17 +36,16 @@ pub async fn run_pty(
     }) {
         Ok(p) => p,
         Err(e) => {
-            log::error!("Failed to open PTY: {e}");
+            log::error!("[pane {pane_id}] Failed to open PTY: {e}");
             return;
         }
     };
 
     // ── Spawn shell ────────────────────────────────────────────────────────
     let shell = crate::platform::default_shell();
-    log::info!("Spawning shell: {}", shell.display());
+    log::info!("[pane {pane_id}] Spawning shell: {}", shell.display());
 
     let mut cmd = CommandBuilder::new(&shell);
-    // Ensure the shell starts in a sane working directory
     if let Ok(cwd) = std::env::current_dir() {
         cmd.cwd(cwd);
     }
@@ -52,26 +53,24 @@ pub async fn run_pty(
     let _child = match pair.slave.spawn_command(cmd) {
         Ok(c) => c,
         Err(e) => {
-            log::error!("Failed to spawn shell: {e}");
+            log::error!("[pane {pane_id}] Failed to spawn shell: {e}");
             return;
         }
     };
 
-    // slave side is no longer needed after spawning
     drop(pair.slave);
 
     // ── PTY reader — blocking task ─────────────────────────────────────────
     let master_reader = match pair.master.try_clone_reader() {
         Ok(r) => r,
         Err(e) => {
-            log::error!("Failed to clone PTY reader: {e}");
+            log::error!("[pane {pane_id}] Failed to clone PTY reader: {e}");
             return;
         }
     };
 
     let proxy_reader = proxy.clone();
 
-    // portable-pty I/O is synchronous; run it on a blocking thread.
     tokio::task::spawn_blocking(move || {
         use std::io::Read;
         let mut reader = master_reader;
@@ -79,29 +78,32 @@ pub async fn run_pty(
 
         loop {
             match reader.read(&mut buf) {
-                Ok(0) => break, // PTY closed
+                Ok(0) => break,
                 Ok(n) => {
                     let bytes = buf[..n].to_vec();
-                    if proxy_reader.send_event(UserEvent::PtyOutput(bytes)).is_err() {
-                        break; // window gone
+                    if proxy_reader
+                        .send_event(UserEvent::PtyOutput { pane_id, bytes })
+                        .is_err()
+                    {
+                        break;
                     }
                 }
                 Err(e) => {
-                    log::debug!("PTY read ended: {e}");
+                    log::debug!("[pane {pane_id}] PTY read ended: {e}");
                     break;
                 }
             }
         }
 
-        log::info!("PTY reader finished — sending PtyExited");
-        let _ = proxy_reader.send_event(UserEvent::PtyExited);
+        log::info!("[pane {pane_id}] PTY reader finished — sending PtyExited");
+        let _ = proxy_reader.send_event(UserEvent::PtyExited { pane_id });
     });
 
     // ── PTY writer — async loop ────────────────────────────────────────────
     let mut master_writer = match pair.master.take_writer() {
         Ok(w) => w,
         Err(e) => {
-            log::error!("Failed to take PTY writer: {e}");
+            log::error!("[pane {pane_id}] Failed to take PTY writer: {e}");
             return;
         }
     };
@@ -111,12 +113,12 @@ pub async fn run_pty(
             use std::io::Write;
             master_writer.write_all(&bytes)
         } {
-            log::debug!("PTY write error: {e}");
+            log::debug!("[pane {pane_id}] PTY write error: {e}");
             break;
         }
     }
 
-    log::debug!("PTY writer task ended");
-    let _ = dirty; // keep alive until here
+    log::debug!("[pane {pane_id}] PTY writer task ended");
+    let _ = dirty;
     let _ = terminal;
 }

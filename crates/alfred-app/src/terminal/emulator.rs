@@ -89,12 +89,15 @@ impl TerminalState {
         (p.line.0 as u16, p.column.0 as u16)
     }
 
-    /// Collect all visible cells for rendering.
-    pub fn collect_cells(&self) -> Vec<TermCell> {
+    /// Collect all visible cells and the cursor position in a single pass —
+    /// avoids taking the terminal lock twice from the caller.
+    pub fn collect_frame(&self) -> (Vec<TermCell>, (u16, u16)) {
         let content = self.term.renderable_content();
+        let p = content.cursor.point;
+        let cursor = (p.line.0 as u16, p.column.0 as u16);
+
         let mut cells =
             Vec::with_capacity((self.cols as usize) * (self.rows as usize));
-
         for indexed in content.display_iter {
             cells.push(TermCell {
                 row: indexed.point.line.0 as u16,
@@ -104,8 +107,18 @@ impl TerminalState {
                 bg: color_to_rgb(&indexed.cell.bg),
             });
         }
+        (cells, cursor)
+    }
 
-        cells
+    /// Collect all visible cells for rendering.
+    pub fn collect_cells(&self) -> Vec<TermCell> {
+        self.collect_frame().0
+    }
+
+    /// Scroll the terminal viewport. Positive `delta` = scroll up (show history).
+    pub fn scroll_display(&mut self, delta: i32) {
+        use alacritty_terminal::grid::Scroll;
+        self.term.scroll_display(Scroll::Delta(delta));
     }
 }
 

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use glyphon::{
@@ -9,16 +10,28 @@ use winit::dpi::PhysicalSize;
 use winit::window::Window;
 
 use crate::terminal::emulator::TermCell;
+use crate::workspace::layout::PhysRect;
+use crate::workspace::pane::PaneId;
 
 const FONT_SIZE: f32 = 14.0;
 const LINE_HEIGHT: f32 = 18.0;
 const PADDING: f32 = 4.0;
 
-/// Font family used for terminal text.
 const TERM_FONT_FAMILY: Family<'static> = Family::Monospace;
 
+/// Data for one pane passed to `Renderer::render` each frame.
+pub struct PaneView<'a> {
+    pub id: PaneId,
+    pub cells: &'a [TermCell],
+    pub cursor: (u16, u16),
+    /// Physical-pixel rect within the window.
+    pub rect: PhysRect,
+    pub is_active: bool,
+    /// When false the pane's Buffer is already up-to-date — skip reshaping.
+    pub needs_reshape: bool,
+}
+
 pub struct Renderer {
-    /// Kept alive to ensure the surface remains valid (Arc ownership).
     _window: Arc<Window>,
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
@@ -30,7 +43,11 @@ pub struct Renderer {
     viewport: Viewport,
     atlas: TextAtlas,
     text_renderer: TextRenderer,
-    text_buffer: Buffer,
+
+    /// One `Buffer` per pane — persisted across frames so glyphon reuses
+    /// the glyph atlas rather than re-rasterising glyphs every frame.
+    pane_buffers: HashMap<PaneId, Buffer>,
+
     scale_factor: f32,
 }
 
@@ -45,11 +62,9 @@ impl Renderer {
             ..Default::default()
         });
 
-        // SAFETY: surface lives as long as window (Arc-owned).
         let surface = instance.create_surface(window.clone())?;
 
-        // ── Adapter ─────────────────────────────────────────────────────
-        // Log all candidates so the user can verify AMD iGPU is selected.
+        // ── Adapter ────────────────────────────────────────────────────────
         let candidates = instance.enumerate_adapters(crate::platform::gpu_backends());
         for a in &candidates {
             let info = a.get_info();
@@ -79,7 +94,7 @@ impl Renderer {
             )
             .await?;
 
-        // ── Surface config ─────────────────────────────────────────────────
+        // ── Surface config ──────────────────────────────────────────────────
         let caps = surface.get_capabilities(&adapter);
         let surface_format = caps
             .formats
@@ -100,11 +115,9 @@ impl Renderer {
         };
         surface.configure(&device, &config);
 
-        // ── glyphon setup ──────────────────────────────────────────────────
+        // ── glyphon setup ───────────────────────────────────────────────────
         let mut font_system = FontSystem::new();
 
-        // Preload monospace fonts so Family::Monospace has good candidates.
-        // Load ALL available — cosmic-text will pick the best one.
         #[cfg(target_os = "windows")]
         {
             let candidates = [
@@ -112,11 +125,11 @@ impl Renderer {
                 r"C:\Windows\Fonts\CascadiaCodePL.ttf",
                 r"C:\Windows\Fonts\CascadiaMono.ttf",
                 r"C:\Windows\Fonts\CascadiaMonoPL.ttf",
-                r"C:\Windows\Fonts\consola.ttf",     // Consolas regular
-                r"C:\Windows\Fonts\consolab.ttf",    // Consolas bold
-                r"C:\Windows\Fonts\consolai.ttf",    // Consolas italic
-                r"C:\Windows\Fonts\consolaz.ttf",    // Consolas bold italic
-                r"C:\Windows\Fonts\lucon.ttf",       // Lucida Console
+                r"C:\Windows\Fonts\consola.ttf",
+                r"C:\Windows\Fonts\consolab.ttf",
+                r"C:\Windows\Fonts\consolai.ttf",
+                r"C:\Windows\Fonts\consolaz.ttf",
+                r"C:\Windows\Fonts\lucon.ttf",
             ];
             let mut loaded_name: Option<&str> = None;
             for path in &candidates {
@@ -126,32 +139,23 @@ impl Renderer {
                     if loaded_name.is_none() {
                         loaded_name = Some(match *path {
                             p if p.contains("Cascadia") => "Cascadia Code",
-                            p if p.contains("consola")  => "Consolas",
-                            _                            => "Lucida Console",
+                            p if p.contains("consola") => "Consolas",
+                            _ => "Lucida Console",
                         });
                     }
                 }
             }
-
-            // Tell fontdb which family to use for Family::Monospace.
-            // Without this call, Family::Monospace resolves to nothing on Windows.
             let mono = loaded_name.unwrap_or("Consolas");
             font_system.db_mut().set_monospace_family(mono);
             log::info!("Monospace family set to: {mono}");
         }
+
         let swash_cache = SwashCache::new();
         let cache = Cache::new(&device);
         let viewport = Viewport::new(&device, &cache);
         let mut atlas = TextAtlas::new(&device, &queue, &cache, surface_format);
         let text_renderer =
             TextRenderer::new(&mut atlas, &device, MultisampleState::default(), None);
-
-        // Create an empty buffer; size is set on first render.
-        // Scale font metrics by DPI so text is physically correct on HiDPI screens.
-        let text_buffer = Buffer::new(
-            &mut font_system,
-            Metrics::new(FONT_SIZE * scale_factor, LINE_HEIGHT * scale_factor),
-        );
 
         Ok(Self {
             _window: window,
@@ -164,12 +168,12 @@ impl Renderer {
             viewport,
             atlas,
             text_renderer,
-            text_buffer,
+            pane_buffers: HashMap::new(),
             scale_factor,
         })
     }
 
-    // ── Public interface ───────────────────────────────────────────────────
+    // ── Public interface ────────────────────────────────────────────────────
 
     pub fn resize(&mut self, size: PhysicalSize<u32>) {
         if size.width == 0 || size.height == 0 {
@@ -184,51 +188,76 @@ impl Renderer {
         self.surface.configure(&self.device, &self.config);
     }
 
-    pub fn render(
-        &mut self,
-        cells: &[TermCell],
-        cursor: (u16, u16),
-    ) -> Result<(), wgpu::SurfaceError> {
-        let frame = self.surface.get_current_texture()?;
-        let view = frame
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
+    /// Render all visible panes in one wgpu pass.
+    pub fn render(&mut self, panes: &[PaneView<'_>]) -> Result<(), wgpu::SurfaceError> {
+        let default_attrs = Attrs::new().family(TERM_FONT_FAMILY);
+        let metrics = Metrics::new(FONT_SIZE * self.scale_factor, LINE_HEIGHT * self.scale_factor);
 
-        let w = self.config.width as f32;
-        let h = self.config.height as f32;
+        // ── Pass 1: update / create a Buffer for each pane ─────────────────
+        for pane in panes.iter() {
+            // Ensure the buffer exists.
+            if !self.pane_buffers.contains_key(&pane.id) {
+                let buf = Buffer::new(&mut self.font_system, metrics);
+                self.pane_buffers.insert(pane.id, buf);
+            }
 
-        // ── Build text ─────────────────────────────────────────────────────
-        let rows = build_rows(cells);
-        let spans = build_spans(&rows, cursor);
-
-        // Debug: log on first few renders so we can confirm data is flowing.
-        static RENDER_COUNT: std::sync::atomic::AtomicU32 =
-            std::sync::atomic::AtomicU32::new(0);
-        let rc = RENDER_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if rc < 5 {
-            let non_space = cells.iter().filter(|c| c.ch != ' ').count();
-            log::info!(
-                "render #{rc}: {} total cells, {} non-space, {} spans",
-                cells.len(), non_space, spans.len()
+            // Always resize the buffer when the rect changes.
+            let buf = self.pane_buffers.get_mut(&pane.id).unwrap();
+            buf.set_size(
+                &mut self.font_system,
+                Some(pane.rect.w as f32 - PADDING * 2.0),
+                Some(pane.rect.h as f32 - PADDING * 2.0),
             );
+
+            // Skip reshaping if the pane's cells have not changed.
+            if pane.needs_reshape {
+                let rows = build_rows(pane.cells);
+                let spans = build_spans(&rows, pane.cursor, pane.is_active);
+                buf.set_rich_text(
+                    &mut self.font_system,
+                    spans.iter().map(|(s, a)| (s.as_str(), *a)),
+                    default_attrs,
+                    Shaping::Basic,
+                );
+                buf.shape_until_scroll(&mut self.font_system, false);
+            }
         }
 
-        self.text_buffer.set_size(
-            &mut self.font_system,
-            Some(w - PADDING * 2.0),
-            Some(h - PADDING * 2.0),
-        );
+        // Drop stale buffers for panes no longer visible.
+        let active_ids: std::collections::HashSet<PaneId> =
+            panes.iter().map(|p| p.id).collect();
+        self.pane_buffers.retain(|id, _| active_ids.contains(id));
 
-        self.text_buffer.set_rich_text(
-            &mut self.font_system,
-            spans.iter().map(|(s, a)| (s.as_str(), *a)),
-            Attrs::new().family(TERM_FONT_FAMILY),
-            Shaping::Basic,
-        );
-        self.text_buffer
-            .shape_until_scroll(&mut self.font_system, false);
+        // ── Pass 2: build TextArea slice (immutable refs) ───────────────────
+        let text_areas: Vec<TextArea<'_>> = panes
+            .iter()
+            .map(|pane| {
+                let buf = &self.pane_buffers[&pane.id];
+                let active_color = if pane.is_active {
+                    Color::rgb(235, 219, 178) // Gruvbox fg
+                } else {
+                    Color::rgb(168, 153, 132) // Gruvbox gray — dim inactive panes
+                };
+                TextArea {
+                    buffer: buf,
+                    left: pane.rect.x as f32 + PADDING,
+                    top: pane.rect.y as f32 + PADDING,
+                    // Metrics are already in physical pixels (×scale_factor),
+                    // so we must NOT re-apply scale here (would double-scale).
+                    scale: 1.0,
+                    bounds: TextBounds {
+                        left: pane.rect.x as i32,
+                        top: pane.rect.y as i32,
+                        right: (pane.rect.x + pane.rect.w) as i32,
+                        bottom: (pane.rect.y + pane.rect.h) as i32,
+                    },
+                    default_color: active_color,
+                    custom_glyphs: &[],
+                }
+            })
+            .collect();
 
-        // ── glyphon prepare ────────────────────────────────────────────────
+        // ── glyphon prepare ─────────────────────────────────────────────────
         self.viewport.update(
             &self.queue,
             Resolution {
@@ -244,25 +273,17 @@ impl Renderer {
                 &mut self.font_system,
                 &mut self.atlas,
                 &self.viewport,
-                [TextArea {
-                    buffer: &self.text_buffer,
-                    left: PADDING,
-                    top: PADDING,
-                    scale: self.scale_factor,
-                    bounds: TextBounds {
-                        left: 0,
-                        top: 0,
-                        right: self.config.width as i32,
-                        bottom: self.config.height as i32,
-                    },
-                    default_color: Color::rgb(235, 219, 178),
-                    custom_glyphs: &[],
-                }],
+                text_areas,
                 &mut self.swash_cache,
             )
             .expect("glyphon prepare");
 
-        // ── wgpu render pass ───────────────────────────────────────────────
+        // ── wgpu render pass ────────────────────────────────────────────────
+        let frame = self.surface.get_current_texture()?;
+        let view = frame
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+
         let mut encoder =
             self.device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -276,10 +297,7 @@ impl Renderer {
                     view: &view,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        // wgpu clear color is LINEAR.  sRGB #1d2021 (Gruvbox
-                        // hard dark) = 29/255 = 0.114 sRGB
-                        // → linear ≈ (0.114/12.92) ≈ 0.0088.
-                        // Using ~0.010 gives a near-black dark terminal bg.
+                        // Gruvbox hard-dark #1d2021 in linear space ≈ 0.010.
                         load: wgpu::LoadOp::Clear(wgpu::Color {
                             r: 0.010,
                             g: 0.010,
@@ -306,7 +324,7 @@ impl Renderer {
     }
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
+// ── Text building helpers ─────────────────────────────────────────────────────
 
 type Row = Vec<TermCell>;
 
@@ -327,9 +345,14 @@ fn build_rows(cells: &[TermCell]) -> Vec<Row> {
 
 /// Build `(text, Attrs)` spans for `set_rich_text`.
 ///
-/// Groups consecutive same-coloured cells into a single span so we minimise
-/// the number of spans without sacrificing per-cell colour accuracy.
-fn build_spans(rows: &[Row], cursor: (u16, u16)) -> Vec<(String, Attrs<'static>)> {
+/// Consecutive cells with the same foreground colour are merged into one span.
+/// The cursor cell is replaced with `█` and rendered in Gruvbox foreground.
+/// When `show_cursor` is false (inactive pane) the cursor is not rendered.
+fn build_spans(
+    rows: &[Row],
+    cursor: (u16, u16),
+    show_cursor: bool,
+) -> Vec<(String, Attrs<'static>)> {
     let mut spans: Vec<(String, Attrs<'static>)> = Vec::new();
     let (cur_row, cur_col) = cursor;
     let default_attrs = Attrs::new().family(Family::Monospace);
@@ -340,7 +363,6 @@ fn build_spans(rows: &[Row], cursor: (u16, u16)) -> Vec<(String, Attrs<'static>)
             continue;
         }
 
-        // Fill a contiguous array of (char, fg_rgb) so gaps become spaces.
         let max_col = row.last().map(|c| c.col).unwrap_or(0) as usize;
         let mut row_chars: Vec<(char, [u8; 3])> =
             vec![(' ', [235u8, 219, 178]); max_col + 1];
@@ -350,31 +372,31 @@ fn build_spans(rows: &[Row], cursor: (u16, u16)) -> Vec<(String, Attrs<'static>)
             }
         }
 
-        // Merge runs with the same colour into one span
         let mut i = 0;
         while i < row_chars.len() {
             let (ch, fg) = row_chars[i];
-            let is_cursor = row_idx as u16 == cur_row && i as u16 == cur_col;
+            let is_cursor =
+                show_cursor && row_idx as u16 == cur_row && i as u16 == cur_col;
 
             let color = if is_cursor {
-                Color::rgb(235, 219, 178) // Gruvbox fg — bright block on dark bg
+                Color::rgb(235, 219, 178)
             } else {
                 Color::rgb(fg[0], fg[1], fg[2])
             };
 
             let mut run = String::new();
-            // Render cursor as a full-block character (█) so it's visible
-            // even when the underlying cell is a space.
             if is_cursor {
                 run.push('█');
             } else {
                 run.push(ch);
             }
+
             let mut j = i + 1;
             if !is_cursor {
                 while j < row_chars.len() {
                     let (nch, nfg) = row_chars[j];
-                    let next_cursor = row_idx as u16 == cur_row && j as u16 == cur_col;
+                    let next_cursor =
+                        show_cursor && row_idx as u16 == cur_row && j as u16 == cur_col;
                     if nfg == fg && !next_cursor {
                         run.push(nch);
                         j += 1;
@@ -384,8 +406,7 @@ fn build_spans(rows: &[Row], cursor: (u16, u16)) -> Vec<(String, Attrs<'static>)
                 }
             }
 
-            let attrs = default_attrs.color(color);
-            spans.push((run, attrs));
+            spans.push((run, default_attrs.color(color)));
             i = j;
         }
 
