@@ -14,6 +14,9 @@ const FONT_SIZE: f32 = 14.0;
 const LINE_HEIGHT: f32 = 18.0;
 const PADDING: f32 = 4.0;
 
+/// Font family used for terminal text.
+const TERM_FONT_FAMILY: Family<'static> = Family::Monospace;
+
 pub struct Renderer {
     /// Kept alive to ensure the surface remains valid (Arc ownership).
     _window: Arc<Window>,
@@ -97,6 +100,32 @@ impl Renderer {
 
         // ── glyphon setup ──────────────────────────────────────────────────
         let mut font_system = FontSystem::new();
+
+        // Preload monospace fonts so Family::Monospace has good candidates.
+        // Load ALL available — cosmic-text will pick the best one.
+        #[cfg(target_os = "windows")]
+        {
+            let candidates = [
+                r"C:\Windows\Fonts\CascadiaCode.ttf",
+                r"C:\Windows\Fonts\CascadiaCodePL.ttf",
+                r"C:\Windows\Fonts\CascadiaMono.ttf",
+                r"C:\Windows\Fonts\CascadiaMonoPL.ttf",
+                r"C:\Windows\Fonts\consola.ttf",     // Consolas regular
+                r"C:\Windows\Fonts\consolab.ttf",    // Consolas bold
+                r"C:\Windows\Fonts\consolai.ttf",    // Consolas italic
+                r"C:\Windows\Fonts\consolaz.ttf",    // Consolas bold italic
+                r"C:\Windows\Fonts\lucon.ttf",       // Lucida Console
+            ];
+            let mut count = 0usize;
+            for path in &candidates {
+                if let Ok(bytes) = std::fs::read(path) {
+                    font_system.db_mut().load_font_data(bytes);
+                    log::debug!("Loaded font: {path}");
+                    count += 1;
+                }
+            }
+            log::info!("Loaded {count} monospace font(s) from system");
+        }
         let swash_cache = SwashCache::new();
         let cache = Cache::new(&device);
         let viewport = Viewport::new(&device, &cache);
@@ -163,7 +192,7 @@ impl Renderer {
         self.text_buffer.set_rich_text(
             &mut self.font_system,
             spans.iter().map(|(s, a)| (s.as_str(), *a)),
-            Attrs::new().family(Family::Monospace),
+            Attrs::new().family(TERM_FONT_FAMILY),
             Shaping::Basic,
         );
         self.text_buffer
@@ -217,10 +246,14 @@ impl Renderer {
                     view: &view,
                     resolve_target: None,
                     ops: wgpu::Operations {
+                        // wgpu clear color is LINEAR.  sRGB #1d2021 (Gruvbox
+                        // hard dark) = 29/255 = 0.114 sRGB
+                        // → linear ≈ (0.114/12.92) ≈ 0.0088.
+                        // Using ~0.010 gives a near-black dark terminal bg.
                         load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.157,
-                            g: 0.157,
-                            b: 0.157,
+                            r: 0.010,
+                            g: 0.010,
+                            b: 0.010,
                             a: 1.0,
                         }),
                         store: wgpu::StoreOp::Store,

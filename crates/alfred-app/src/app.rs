@@ -59,6 +59,9 @@ impl ApplicationHandler<UserEvent> for App {
             return; // already initialised (e.g. Android resume)
         }
 
+        // Wait for events rather than spinning — essential for an idle terminal.
+        event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
+
         // ── Create window ──────────────────────────────────────────────────
         let attrs = Window::default_attributes()
             .with_title("Alfred")
